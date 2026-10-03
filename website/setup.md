@@ -748,6 +748,8 @@ npx -y @playwright/mcp@latest --version
 
 That installs `@playwright/mcp` plus Playwright (~300MB total). Restart Odysseus and the server will register at startup.
 
+The browser server keeps a Node process resident and launches Chromium when the agent first uses it. On low-memory hosts, set `ODYSSEUS_DISABLE_BROWSER_MCP=1` to skip it. The image-generation server starts on the first `generate_image` call rather than at boot.
+
 ## Architecture
 ```
 app.py                   # FastAPI entry point

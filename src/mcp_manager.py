@@ -148,6 +148,8 @@ class McpManager:
         self._connect_tasks: Dict[str, Any] = {}
         # Tracking updates to tools/connections for RAG indexing / prompt cache
         self._generation = 0
+        # server_id -> lock serializing the on-demand start of a lazy built-in
+        self._lazy_locks: Dict[str, asyncio.Lock] = {}
 
     async def connect_server(
         self,
@@ -477,6 +479,8 @@ class McpManager:
         tool_name = parts[2]
 
         session = self._sessions.get(server_id)
+        if not session and await self._ensure_lazy_builtin(server_id):
+            session = self._sessions.get(server_id)
         if not session:
             return {"error": f"MCP server not connected: {server_id}", "exit_code": 1}
 
@@ -535,6 +539,21 @@ class McpManager:
         if images:
             result_dict["images"] = images
         return result_dict
+
+    async def _ensure_lazy_builtin(self, server_id: str) -> bool:
+        """Spawn an on-demand built-in server on its first tool call."""
+        from src.builtin_mcp import LAZY_BUILTIN_SERVERS, MCP_DISABLED
+
+        if MCP_DISABLED or server_id not in LAZY_BUILTIN_SERVERS:
+            return False
+        lock = self._lazy_locks.setdefault(server_id, asyncio.Lock())
+        async with lock:
+            if server_id in self._sessions:
+                return True
+            # Connect in a task of its own, as startup registration does, so the
+            # stdio transport's task group is not owned by the calling request
+            # task; shield it so a cancelled request cannot abort the spawn.
+            return await asyncio.shield(asyncio.ensure_future(self._reconnect_builtin(server_id)))
 
     async def _reconnect_builtin(self, server_id: str) -> bool:
         """Tear down and reconnect a crashed builtin MCP server."""
@@ -642,8 +661,6 @@ class McpManager:
         """Check if a server is a built-in (auto-registered) server."""
         return server_id.startswith("builtin_") or server_id in {
             "image_gen",
-            "memory",
-            "rag",
             "email",
         }
 

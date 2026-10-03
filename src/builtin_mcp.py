@@ -66,15 +66,21 @@ def _find_npx() -> str:
 # execution (src/tool_execution.py:_direct_fallback). Those trivial subprocess
 # wrappers are gone.
 #
-# image_gen / memory / rag / email still run as stdio MCP servers — each
-# carries hundreds of LOC of unique IMAP / HTTP / manager logic not worth
-# duplicating into the native path right now.
+# image_gen / email still run as stdio MCP servers — each carries hundreds of
+# LOC of unique IMAP / HTTP logic not worth duplicating into the native path
+# right now. mcp_servers/memory_server.py and rag_server.py are standalone
+# servers for external MCP clients only: the agent uses native manage_memory /
+# RAG paths and never saw their tools, so the app no longer spawns them.
 _BUILTIN_SERVERS = {
     "image_gen":  ("mcp_servers/image_gen_server.py",  "Built-in: Image Generation"),
-    "memory":     ("mcp_servers/memory_server.py",     "Built-in: Memory"),
-    "rag":        ("mcp_servers/rag_server.py",        "Built-in: RAG"),
     "email":      ("mcp_servers/email_server.py",      "Built-in: Email"),
 }
+
+# Built-ins spawned on their first tool call instead of at boot. Their tools are
+# reached through fixed tool names (generate_image), not the discovered MCP tool
+# list, so nothing needs them connected up front. Email stays eager: plan mode
+# classifies its discovered tools as read-only or not.
+LAZY_BUILTIN_SERVERS = frozenset({"image_gen"})
 
 # NPX-based built-in servers (run via npx, not Python)
 _BUILTIN_NPX_SERVERS = {
@@ -88,6 +94,7 @@ _BUILTIN_NPX_SERVERS = {
 # Global flag to disable MCP if there are compatibility issues
 MCP_DISABLED = os.environ.get("ODYSSEUS_DISABLE_MCP", "").lower() in ("1", "true", "yes")
 BROWSER_MCP_REQUIRE_CACHE = os.environ.get("ODYSSEUS_BROWSER_MCP_REQUIRE_CACHE", "").lower() in ("1", "true", "yes")
+BROWSER_MCP_DISABLED = os.environ.get("ODYSSEUS_DISABLE_BROWSER_MCP", "").lower() in ("1", "true", "yes")
 
 
 # Strong references to the fire-and-forget startup tasks scheduled below.
@@ -190,6 +197,8 @@ async def register_builtin_servers(mcp_manager):
             logger.warning(f"Built-in MCP server {name} error: {type(e).__name__}: {e}")
 
     for server_id, (script, name) in _BUILTIN_SERVERS.items():
+        if server_id in LAZY_BUILTIN_SERVERS:
+            continue
         script_path = os.path.join(base_dir, script)
         if not os.path.exists(script_path):
             logger.warning(f"Built-in MCP server script not found: {script_path}")
@@ -197,6 +206,9 @@ async def register_builtin_servers(mcp_manager):
         _spawn_bg(_connect_python_server(server_id, script_path, name))
 
     # Register NPX-based servers in the background (they take longer to start)
+    if BROWSER_MCP_DISABLED:
+        logger.info("Built-in browser MCP server disabled via ODYSSEUS_DISABLE_BROWSER_MCP")
+        return
     npx_path = _find_npx()
     logger.info(f"NPX binary resolved to: {npx_path}")
 
