@@ -27,6 +27,7 @@ if os.name == "nt":
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import logging
+import threading
 import numpy as np
 import httpx
 from typing import List, Optional
@@ -37,6 +38,70 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "all-minilm:l6-v2"
 _DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+# One ONNX session per (model, cache dir) per process. RAG, memory, the tool
+# index and the HTTP-lane probe fallback each construct a FastEmbedClient;
+# without this every one of them loaded its own copy of the model weights and
+# ONNX runtime arenas. Each entry carries a lock because the clients are used
+# from several threads at once and fastembed does not document TextEmbedding
+# as thread-safe.
+_shared_models: dict = {}
+_shared_models_lock = threading.Lock()
+
+
+def _heal_windows_symlink_cache(cache_dir: str) -> None:
+    # Windows self-heal: the HuggingFace-hub cache stores model files as
+    # symlinks (snapshots/<rev>/model.onnx -> ../../blobs/<hash>). On a
+    # network-share / UNC data dir Windows refuses to follow them
+    # ([WinError 1463] "symbolic link cannot be followed because its type is
+    # disabled"), and a cache copied between machines can carry dead symlinks
+    # too. Either way fastembed tries to load a broken symlink and fails
+    # *without* re-downloading, leaving semantic memory degraded. Detect a
+    # broken-symlink model in the cache and drop the contaminated hub dir so
+    # fastembed re-fetches (it falls back to its CDN tarball of real files,
+    # which load fine). Best-effort; only ever removes a verifiably dead link.
+    try:
+        import glob, shutil
+        for _onnx in glob.glob(os.path.join(cache_dir, "**", "*.onnx"), recursive=True):
+            if os.path.islink(_onnx) and not os.path.exists(_onnx):
+                _root = _onnx
+                while os.path.basename(_root) and not os.path.basename(_root).startswith("models--"):
+                    _parent = os.path.dirname(_root)
+                    if _parent == _root:
+                        break
+                    _root = _parent
+                if os.path.basename(_root).startswith("models--"):
+                    logger.warning(
+                        "Embedding cache has a broken symlink (%s); clearing %s "
+                        "so fastembed re-downloads real files", _onnx, _root,
+                    )
+                    shutil.rmtree(_root, ignore_errors=True)
+    except Exception as _e:
+        logger.debug("embedding cache symlink-heal skipped: %s", _e)
+
+
+def _shared_text_embedding(model: str, cache_dir: str):
+    """Return the process-wide (TextEmbedding, lock) pair for model, loading it once."""
+    from fastembed import TextEmbedding
+
+    key = (model, cache_dir)
+    with _shared_models_lock:
+        entry = _shared_models.get(key)
+        if entry is None:
+            os.makedirs(cache_dir, exist_ok=True)
+            if os.name == "nt":
+                _heal_windows_symlink_cache(cache_dir)
+            # ONNX Runtime's CPU arena keeps every peak allocation and fragments
+            # across batch shapes: re-embedding ~120 tool descriptions grew it
+            # past 2 GB. Without the arena that peak is freed after each run at
+            # no measurable speed cost for this model.
+            entry = (
+                TextEmbedding(model_name=model, cache_dir=cache_dir, enable_cpu_mem_arena=False),
+                threading.Lock(),
+            )
+            _shared_models[key] = entry
+            logger.info(f"FastEmbed loaded model={model}")
+        return entry
 
 
 class EmbeddingClient:
@@ -134,7 +199,7 @@ class FastEmbedClient:
 
     def __init__(self, model: Optional[str] = None):
         try:
-            from fastembed import TextEmbedding
+            import fastembed  # noqa: F401
         except ImportError as e:
             raise RuntimeError(
                 "Local fastembed is not installed. Either install it "
@@ -146,42 +211,9 @@ class FastEmbedClient:
         # Persistent cache under data/ so the model survives reboots and so
         # the download lands exactly where the admin panel's _is_downloaded()
         # check looks (both default to this same path).
-        cache_dir = FASTEMBED_CACHE_DIR
-        os.makedirs(cache_dir, exist_ok=True)
-        # Windows self-heal: the HuggingFace-hub cache stores model files as
-        # symlinks (snapshots/<rev>/model.onnx -> ../../blobs/<hash>). On a
-        # network-share / UNC data dir Windows refuses to follow them
-        # ([WinError 1463] "symbolic link cannot be followed because its type is
-        # disabled"), and a cache copied between machines can carry dead symlinks
-        # too. Either way fastembed tries to load a broken symlink and fails
-        # *without* re-downloading, leaving semantic memory degraded. Detect a
-        # broken-symlink model in the cache and drop the contaminated hub dir so
-        # fastembed re-fetches (it falls back to its CDN tarball of real files,
-        # which load fine). Best-effort; only ever removes a verifiably dead link.
-        if os.name == "nt":
-            try:
-                import glob, shutil
-                for _onnx in glob.glob(os.path.join(cache_dir, "**", "*.onnx"), recursive=True):
-                    if os.path.islink(_onnx) and not os.path.exists(_onnx):
-                        _root = _onnx
-                        while os.path.basename(_root) and not os.path.basename(_root).startswith("models--"):
-                            _parent = os.path.dirname(_root)
-                            if _parent == _root:
-                                break
-                            _root = _parent
-                        if os.path.basename(_root).startswith("models--"):
-                            logger.warning(
-                                "Embedding cache has a broken symlink (%s); clearing %s "
-                                "so fastembed re-downloads real files", _onnx, _root,
-                            )
-                            shutil.rmtree(_root, ignore_errors=True)
-            except Exception as _e:
-                logger.debug("embedding cache symlink-heal skipped: %s", _e)
-        kwargs = {"model_name": self.model, "cache_dir": cache_dir}
-        self._embedding = TextEmbedding(**kwargs)
+        self._embedding, self._embed_lock = _shared_text_embedding(self.model, FASTEMBED_CACHE_DIR)
         self._dim: Optional[int] = None
         self.url = "local://fastembed"
-        logger.info(f"FastEmbed loaded model={self.model}")
 
     def get_sentence_embedding_dimension(self) -> int:
         if self._dim is not None:
@@ -198,7 +230,8 @@ class FastEmbedClient:
         if not texts:
             return np.array([], dtype="float32")
 
-        vecs = np.array(list(self._embedding.embed(texts)), dtype="float32")
+        with self._embed_lock:
+            vecs = np.array(list(self._embedding.embed(texts)), dtype="float32")
 
         if normalize_embeddings and vecs.size > 0:
             norms = np.linalg.norm(vecs, axis=1, keepdims=True)
